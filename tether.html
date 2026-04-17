@@ -1,0 +1,254 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Tether</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #07090d; overflow: hidden;
+    font: 12px/1.4 ui-monospace, Menlo, monospace; color: #6a7480; }
+  canvas { display: block; cursor: crosshair; }
+  #hint { position: fixed; left: 12px; bottom: 10px; pointer-events: none;
+    letter-spacing: 0.08em; opacity: 0.55; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">click empty space to place · drag nodes to couple</div>
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  let W, H, DPR = window.devicePixelRatio || 1;
+  function resize() {
+    W = window.innerWidth; H = window.innerHeight;
+    canvas.width = W * DPR; canvas.height = H * DPR;
+    canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  window.addEventListener('resize', resize); resize();
+
+  // ---- constants ----
+  const K = 1.6;          // coupling strength
+  const D_MAX = 420;      // interaction radius
+  const FREQS = [1.0, 1.25, 1.333, 1.5];
+  const NODE_R = 14;
+  const MAX_DPHI = 2.5;   // clamp per-node phase adjustment per second
+  const LOCK_EPS = 0.06;  // phase diff (in cycles) considered "locked"
+
+  // ---- state ----
+  const nodes = [];
+  const lockedPairs = new Set();
+  let dragging = null, downPos = null, dragMoved = false;
+
+  function addNode(x, y) {
+    nodes.push({
+      x, y,
+      phase: Math.random(),
+      freq: FREQS[Math.floor(Math.random() * FREQS.length)],
+      r: NODE_R,
+      hue: 180 + Math.random() * 120,
+      prevPhase: 0,
+      wrapFlash: 0,
+    });
+  }
+
+  // seed two nodes so it's alive on open
+  addNode(W * 0.4, H * 0.5);
+  addNode(W * 0.6, H * 0.5);
+
+  // ---- audio ----
+  let audio = null;
+  function ensureAudio() {
+    if (!audio) {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      audio = new AC();
+    }
+    if (audio.state === 'suspended') audio.resume();
+    return audio;
+  }
+  function click(pan, freq, boost = 1) {
+    const ac = ensureAudio(); if (!ac) return;
+    const t = ac.currentTime;
+    const osc = ac.createOscillator();
+    const gain = ac.createGain();
+    const panner = ac.createStereoPanner();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(freq * boost, t);
+    osc.frequency.exponentialRampToValueAtTime(freq * 0.5, t + 0.09);
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(0.22 * boost, t + 0.005);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
+    panner.pan.value = Math.max(-1, Math.min(1, pan));
+    osc.connect(gain).connect(panner).connect(ac.destination);
+    osc.start(t); osc.stop(t + 0.14);
+  }
+  function linkEvent(a, b) {
+    const pan = ((a.x + b.x) / 2 / W - 0.5) * 1.6;
+    const freq = 720 + ((a.hue + b.hue) / 2 - 180) * 2;
+    click(pan, freq, 1.6);
+  }
+
+  // ---- input ----
+  function hit(x, y) {
+    for (let i = nodes.length - 1; i >= 0; i--) {
+      const n = nodes[i], dx = x - n.x, dy = y - n.y;
+      if (dx * dx + dy * dy <= (n.r + 6) * (n.r + 6)) return n;
+    }
+    return null;
+  }
+  canvas.addEventListener('mousedown', e => {
+    ensureAudio();
+    const x = e.clientX, y = e.clientY;
+    downPos = { x, y }; dragMoved = false;
+    dragging = hit(x, y);
+  });
+  canvas.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    if (!dragMoved && Math.hypot(e.clientX - downPos.x, e.clientY - downPos.y) > 3)
+      dragMoved = true;
+    dragging.x = e.clientX; dragging.y = e.clientY;
+  });
+  window.addEventListener('mouseup', e => {
+    if (dragging && !dragMoved) {
+      // clicked an existing node — leave it be
+    } else if (!dragging && downPos) {
+      addNode(e.clientX, e.clientY);
+    }
+    dragging = null; downPos = null;
+  });
+
+  // ---- sim / render ----
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000); last = now;
+
+    // phase update
+    const adjust = new Array(nodes.length).fill(0);
+    const neighbors = new Array(nodes.length).fill(0);
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        const a = nodes[i], b = nodes[j];
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const d = Math.hypot(dx, dy);
+        if (d > D_MAX) continue;
+        neighbors[i]++; neighbors[j]++;
+        // falloff: 1 at touching, 0 at D_MAX, smooth
+        const t = 1 - d / D_MAX;
+        const g = t * t;
+        const diff = b.phase - a.phase;
+        const s = Math.sin(2 * Math.PI * diff);
+        adjust[i] += K * g * s;
+        adjust[j] -= K * g * s;
+      }
+    }
+    for (let i = 0; i < nodes.length; i++) {
+      adjust[i] *= (1 + 0.35 * neighbors[i]);
+    }
+    for (let i = 0; i < nodes.length; i++) {
+      const n = nodes[i];
+      n.prevPhase = n.phase;
+      let dphi = n.freq + Math.max(-MAX_DPHI, Math.min(MAX_DPHI, adjust[i]));
+      n.phase += dphi * dt;
+      if (n.phase >= 1) {
+        n.phase -= Math.floor(n.phase);
+        n.wrapFlash = 1;
+        const pan = (n.x / W - 0.5) * 1.6;
+        click(pan, 520 + (n.hue - 180) * 2);
+      } else if (n.phase < 0) {
+        n.phase -= Math.floor(n.phase);
+      }
+      n.wrapFlash *= Math.pow(0.002, dt); // decay
+    }
+
+    // ---- render ----
+    ctx.fillStyle = 'rgba(7, 9, 13, 0.35)';
+    ctx.fillRect(0, 0, W, H);
+
+    // halos
+    ctx.globalCompositeOperation = 'lighter';
+    for (const n of nodes) {
+      const grd = ctx.createRadialGradient(n.x, n.y, 0, n.x, n.y, D_MAX);
+      const a = 0.06 + 0.05 * Math.sin(2 * Math.PI * n.phase);
+      grd.addColorStop(0, `hsla(${n.hue}, 80%, 60%, ${a})`);
+      grd.addColorStop(1, `hsla(${n.hue}, 80%, 60%, 0)`);
+      ctx.fillStyle = grd;
+      ctx.beginPath(); ctx.arc(n.x, n.y, D_MAX, 0, Math.PI * 2); ctx.fill();
+    }
+
+    // pair overlays — lens + lock line
+    for (let i = 0; i < nodes.length; i++) {
+      for (let j = i + 1; j < nodes.length; j++) {
+        const a = nodes[i], b = nodes[j];
+        const dx = b.x - a.x, dy = b.y - a.y;
+        const d = Math.hypot(dx, dy);
+        if (d >= 2 * D_MAX || d < 0.0001) continue;
+
+        let pd = (b.phase - a.phase); pd = pd - Math.round(pd); // in [-0.5, 0.5]
+        const coherence = 1 - Math.min(1, Math.abs(pd) * 2); // 1 = locked
+
+        // lens — intersection of two halo circles, brighter when coherent
+        const t = 1 - d / (2 * D_MAX);
+        const lensA = 0.12 * coherence * t;
+        if (lensA > 0.005) {
+          const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
+          const grd = ctx.createRadialGradient(mx, my, 0, mx, my, D_MAX * 0.8);
+          grd.addColorStop(0, `hsla(${(a.hue + b.hue) / 2}, 90%, 70%, ${lensA})`);
+          grd.addColorStop(1, 'hsla(0,0%,0%,0)');
+          ctx.save();
+          // clip to both halos
+          ctx.beginPath(); ctx.arc(a.x, a.y, D_MAX, 0, Math.PI * 2); ctx.clip();
+          ctx.beginPath(); ctx.arc(b.x, b.y, D_MAX, 0, Math.PI * 2); ctx.clip();
+          ctx.fillStyle = grd;
+          ctx.fillRect(Math.min(a.x, b.x) - D_MAX, Math.min(a.y, b.y) - D_MAX,
+                       Math.abs(dx) + 2 * D_MAX, Math.abs(dy) + 2 * D_MAX);
+          ctx.restore();
+        }
+
+        // lock line + link formation event
+        const locked = Math.abs(pd) < LOCK_EPS && d < D_MAX * 1.2;
+        const key = i + ':' + j;
+        if (locked) {
+          if (!lockedPairs.has(key)) {
+            lockedPairs.add(key);
+            linkEvent(a, b);
+            a.wrapFlash = Math.max(a.wrapFlash, 1);
+            b.wrapFlash = Math.max(b.wrapFlash, 1);
+          }
+          const pulse = Math.max(a.wrapFlash, b.wrapFlash);
+          const alpha = 0.25 + 0.6 * pulse;
+          ctx.strokeStyle = `hsla(${(a.hue + b.hue) / 2}, 90%, 80%, ${alpha})`;
+          ctx.lineWidth = 0.6 + 1.4 * pulse;
+          ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+        } else if (lockedPairs.has(key)) {
+          lockedPairs.delete(key);
+        }
+      }
+    }
+
+    // node cores
+    for (const n of nodes) {
+      const pulse = 0.5 + 0.5 * Math.sin(2 * Math.PI * n.phase);
+      const flash = n.wrapFlash;
+      const r = n.r * (1 + 0.15 * pulse + 0.25 * flash);
+
+      // outer soft
+      const grd = ctx.createRadialGradient(n.x, n.y, 0, n.x, n.y, r * 3);
+      grd.addColorStop(0, `hsla(${n.hue}, 90%, 75%, ${0.55 + 0.35 * flash})`);
+      grd.addColorStop(0.4, `hsla(${n.hue}, 90%, 60%, 0.15)`);
+      grd.addColorStop(1, `hsla(${n.hue}, 90%, 60%, 0)`);
+      ctx.fillStyle = grd;
+      ctx.beginPath(); ctx.arc(n.x, n.y, r * 3, 0, Math.PI * 2); ctx.fill();
+
+      // core dot
+      ctx.fillStyle = `hsla(${n.hue}, 95%, ${70 + 20 * pulse}%, 1)`;
+      ctx.beginPath(); ctx.arc(n.x, n.y, r * 0.55, 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalCompositeOperation = 'source-over';
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
