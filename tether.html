@@ -151,6 +151,12 @@
         const pc = Math.max(0, 1 - 2 * Math.abs(pd));
         cohSum[i] += pc; cohSum[j] += pc;
         if (Math.abs(pd) < LOCK_EPS) { lockedNb[i] = true; lockedNb[j] = true; }
+        // soft midpoint snap — collapses tiny phase offsets into a shared downbeat
+        if (Math.abs(pd) < 0.03) {
+          const snap = pd * 0.25;
+          a.phase += snap;
+          b.phase -= snap;
+        }
       }
     }
     for (let i = 0; i < nodes.length; i++) {
