@@ -66,21 +66,27 @@
     if (audio.state === 'suspended') audio.resume();
     return audio;
   }
-  function click(pan, freq, boost = 1) {
+  function click(pan, freq, boost = 1, coh = 0) {
     const ac = ensureAudio(); if (!ac) return;
     const t = ac.currentTime;
     const osc = ac.createOscillator();
     const gain = ac.createGain();
     const panner = ac.createStereoPanner();
+    // pull frequency toward a common anchor when coherent (ensemble pitch)
+    const anchored = freq + (520 - freq) * coh * 0.4;
+    const peak  = 0.22 * boost * (1 + 0.8 * coh);
+    const decay = 0.12 - 0.05 * coh;   // tighter envelope when locked
+    const slide = 0.09 - 0.04 * coh;
+    const tail  = 0.5  + 0.3  * coh;   // less pitch drop when locked
     osc.type = 'triangle';
-    osc.frequency.setValueAtTime(freq * boost, t);
-    osc.frequency.exponentialRampToValueAtTime(freq * 0.5, t + 0.09);
+    osc.frequency.setValueAtTime(anchored * boost, t);
+    osc.frequency.exponentialRampToValueAtTime(anchored * tail, t + slide);
     gain.gain.setValueAtTime(0.0001, t);
-    gain.gain.exponentialRampToValueAtTime(0.22 * boost, t + 0.005);
-    gain.gain.exponentialRampToValueAtTime(0.0001, t + 0.12);
+    gain.gain.exponentialRampToValueAtTime(peak, t + 0.005);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + decay);
     panner.pan.value = Math.max(-1, Math.min(1, pan));
     osc.connect(gain).connect(panner).connect(ac.destination);
-    osc.start(t); osc.stop(t + 0.14);
+    osc.start(t); osc.stop(t + decay + 0.02);
   }
   function linkEvent(a, b) {
     const pan = ((a.x + b.x) / 2 / W - 0.5) * 1.6;
@@ -125,6 +131,8 @@
     // phase update
     const adjust = new Array(nodes.length).fill(0);
     const neighbors = new Array(nodes.length).fill(0);
+    const cohSum = new Array(nodes.length).fill(0);
+    const lockedNb = new Array(nodes.length).fill(false);
     for (let i = 0; i < nodes.length; i++) {
       for (let j = i + 1; j < nodes.length; j++) {
         const a = nodes[i], b = nodes[j];
@@ -139,10 +147,17 @@
         const s = Math.sin(2 * Math.PI * diff);
         adjust[i] += K * g * s;
         adjust[j] -= K * g * s;
+        const pd = diff - Math.round(diff);
+        const pc = Math.max(0, 1 - 2 * Math.abs(pd));
+        cohSum[i] += pc; cohSum[j] += pc;
+        if (Math.abs(pd) < LOCK_EPS) { lockedNb[i] = true; lockedNb[j] = true; }
       }
     }
     for (let i = 0; i < nodes.length; i++) {
       adjust[i] *= (1 + 0.35 * neighbors[i]);
+      const n = nodes[i];
+      n.coherence = neighbors[i] ? cohSum[i] / neighbors[i] : 0;
+      if (lockedNb[i]) n.coherence = Math.max(n.coherence, 0.9);
     }
     for (let i = 0; i < nodes.length; i++) {
       const n = nodes[i];
@@ -153,7 +168,7 @@
         n.phase -= Math.floor(n.phase);
         n.wrapFlash = 1;
         const pan = (n.x / W - 0.5) * 1.6;
-        click(pan, 520 + (n.hue - 180) * 2);
+        click(pan, 520 + (n.hue - 180) * 2, 1, n.coherence || 0);
       } else if (n.phase < 0) {
         n.phase -= Math.floor(n.phase);
       }
